@@ -1,84 +1,160 @@
 package com.pcbe;
 
-import java.util.LinkedList;
-import java.util.Random;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 
-// An office with one FIFO queue shared by several counters. The Office object is the monitor.
+// An office with several counters, each with its OWN queue.
+// - customers join the shortest queue of an open counter;
+// - a waiting customer switches to another open counter if fewer people are in front there;
+// - when a counter goes on a coffee break, its customers move to the other counters;
+// - at least one counter always stays open (Semaphore with counters - 1 break permits).
 public class Office {
 
-    private static class Request {
-        final String customer;
-        final Document document;
-        boolean done;
-
-        Request(String customer, Document document) {
-            this.customer = customer;
-            this.document = document;
-        }
-    }
-
     private final String name;
-    private final int counters;
-    private final LinkedList<Request> queue = new LinkedList<>();
+    private final ReentrantLock lock = new ReentrantLock(true);      // protects all queues of this office
+    private final Condition queuesChanged = lock.newCondition();     // waiting customers re-check their position
+    final Semaphore breakPermits;                                    // how many counters may be on break at once
+    private final List<Counter> counters = new ArrayList<>();
 
-    public Office(String name, int counters) {
+    public Office(String name, int counterCount) {
         this.name = name;
-        this.counters = counters;
+        for (int i = 1; i <= counterCount; i++) {
+            counters.add(new Counter(this, name + "-counter" + i, lock.newCondition()));
+        }
+        this.breakPermits = new Semaphore(counterCount - 1);
     }
 
-    // Starts one thread per counter. Daemon threads stop automatically when the program ends.
+    // Starts the thread of every counter (each runs Counter.run()).
     public void open() {
-        for (int i = 1; i <= counters; i++) {
-            Thread counter = new Thread(this::work, name + "-counter" + i);
-            counter.setDaemon(true);
-            counter.start();
-        }
+        counters.forEach(Thread::start);
     }
+    // ---------------------------------------------------------------- customer side
 
-    // Called by a customer thread: join the queue and wait until a counter issues the document.
-    public synchronized void request(String customer, Document document) throws InterruptedException {
-        Request request = new Request(customer, document);
-        queue.addLast(request);
-        System.out.println(customer + " waits at " + name + " for " + document.name() + " (queue size " + queue.size() + ")");
-        notifyAll();
-        while (!request.done) {
-            wait();
-        }
 
-    }
-    // Called by a counter thread: wait until a customer is in the queue and take the first one.
-    private synchronized Request next() throws InterruptedException {
-        while (queue.isEmpty()) {
-            wait();
-        }
-        return queue.removeFirst();
-    }
-
-    // Called by a counter thread: mark the request as done and wake up the waiting customer.
-    private synchronized void finish(Request request) {
-        request.done = true;
-        notifyAll();
-    }
-
-    // The loop run by each counter thread.
-    private void work() {
-        Random random = new Random();
-        String counter = Thread.currentThread().getName();
+    // Called by a customer thread: choose a queue, then wait (switching queues if useful) until served.
+    public void request(String customer, Document document) throws InterruptedException {
+        lock.lock();
         try {
-            while (true) {
-                Request request = next();
-                Thread.sleep(100 + random.nextInt(200)); // serving the customer (no lock held)
-                System.out.println(counter + " issued " + request.document.name() + " to " + request.customer);
-                finish(request);
+            Request request = new Request(customer, document);
+            Counter chosen = shortestOpenCounter(null);
+            System.out.println(customer + " joins " + chosen.getName() + " for " + document.name() + " " + queues());
+            moveTo(request, chosen);
 
-                if (random.nextInt(100) < 20) { // 20% chance of a coffee break after a customer
-                    System.out.println(counter + " CLOSED for a coffee break");
-                    Thread.sleep(500);
-                    System.out.println(counter + " is OPEN again");
-                }
+            while (!request.done) {
+                considerSwitching(request);
+                queuesChanged.await(); // releases the lock while waiting
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        } finally {
+            lock.unlock();
         }
+    }
+
+    private void considerSwitching(Request request) {
+    // Decides whether a waiting customer should move to another queue. Called with the lock held.
+        Counter current = request.counter;
+        if (current.serving == request) {
+            return; // already at the window, nothing to decide
+        }
+        if (!current.open) {
+            Counter target = shortestOpenCounter(null);
+            System.out.println(request.customer + " LEAVES closed " + current.getName() + " -> " + target.getName() + " " + queues());
+            moveTo(request, target);
+            return;
+        }
+        int ahead = current.queue.indexOf(request) + (current.serving != null ? 1 : 0);
+        Counter target = shortestOpenCounter(current);
+        if (target != null && target.load() < ahead) {
+            System.out.println(request.customer + " SWITCHES " + current.getName() + " -> " + target.getName()
+                    + " (" + ahead + " ahead -> " + target.load() + " ahead) " + queues());
+            moveTo(request, target);
+        }
+    }
+
+    // Puts the request at the end of the target counter's queue. Called with the lock held.
+    private void moveTo(Request request, Counter target) {
+        if (request.counter != null) {
+            request.counter.queue.remove(request);
+        }
+        target.queue.addLast(request);
+        request.counter = target;
+        target.hasWork.signal();     // wake only the counter that now has a new customer
+        queuesChanged.signalAll();   // the queues changed: other customers may want to switch
+    }
+
+    // Open counter with the fewest people in front (ties: lowest number), or null if none besides 'exclude'.
+    private Counter shortestOpenCounter(Counter exclude) {
+        Counter best = null;
+        for (Counter counter : counters) {
+            if (counter.open && counter != exclude && (best == null || counter.load() < best.load())) {
+                best = counter;
+            }
+        }
+        return best;
+    }
+
+    // ---------------------------------------------------------------- counter side
+
+    // Called by a counter thread: wait until someone is in this counter's queue and call them to the window.
+    Request takeNext(Counter counter) throws InterruptedException {
+        lock.lock();
+        try {
+            while (counter.queue.isEmpty()) {
+                counter.hasWork.await();
+            }
+            Request request = counter.queue.removeFirst();
+            counter.serving = request;
+            queuesChanged.signalAll(); // everyone behind moved up one place
+            return request;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // Called by a counter thread: the document is issued, wake the customer.
+    void finish(Counter counter, Request request) {
+        lock.lock();
+        try {
+            System.out.println(counter.getName() + " issued " + request.document.name() + " to " + request.customer);
+            request.done = true;
+            counter.serving = null;
+            queuesChanged.signalAll();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    void closeCounter(Counter counter) {
+        lock.lock();
+        try {
+            counter.open = false;
+            System.out.println(counter.getName() + " CLOSED for a coffee break " + queues());
+            queuesChanged.signalAll(); // its customers must move to open counters
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    void reopenCounter(Counter counter) {
+        lock.lock();
+        try {
+            counter.open = true;
+            System.out.println(counter.getName() + " is OPEN again " + queues());
+            queuesChanged.signalAll(); // customers from long queues may switch here
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // Snapshot of the queues for the log, e.g. "TownHall[2, 0*, 1]" (* = on coffee break).
+    private String queues() {
+        StringBuilder text = new StringBuilder(name).append('[');
+        for (int i = 0; i < counters.size(); i++) {
+            Counter counter = counters.get(i);
+            text.append(i > 0 ? ", " : "").append(counter.load()).append(counter.open ? "" : "*");
+        }
+        return text.append(']').toString();
     }
 }
