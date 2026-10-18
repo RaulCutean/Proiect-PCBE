@@ -126,6 +126,21 @@ public class Office {
         }
     }
 
+    // Is any OTHER counter of this office open right now? (The answer may be outdated as soon as we return.)
+    boolean anotherCounterOpen(Counter counter) {
+        lock.lock();
+        try {
+            for (Counter other : counters) {
+                if (other != counter && other.open) {
+                    return true;
+                }
+            }
+            return false;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     void closeCounter(Counter counter) {
         lock.lock();
         try {

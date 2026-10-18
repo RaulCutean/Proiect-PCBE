@@ -32,18 +32,21 @@ public class Counter extends Thread {
         try {
             while (true) {
                 Request request = office.takeNext(this);    // waits until someone is in MY queue
+
+                // RACE CONDITION (check-then-act): the counter CHECKS now that another counter is open,
+                // but ACTS (closes) only after serving the customer, 100-300 ms later. Two counters of the
+                // same office can both check while the other one is still open, and then BOTH close.
+                // The office then has no open counter, and customers who must move find no counter (null).
+                // The original code used breakPermits.tryAcquire(), which checks and takes in ONE atomic step.
+                boolean takeBreak = random.nextInt(100) < 20 && office.anotherCounterOpen(this);
+
                 Thread.sleep(100 + random.nextInt(200));    // serving the customer (no lock held)
                 office.finish(this, request);               // gives the document to the customer
 
-                if (random.nextInt(100) < 20) {              // wants a coffee break
-                    if (office.breakPermits.tryAcquire()) {  // allowed only if another counter stays open
-                        office.closeCounter(this);           // its customers move to other queues
-                        Thread.sleep(500);
-                        office.reopenCounter(this);
-                        office.breakPermits.release();
-                    } else {
-                        System.out.println(getName() + " wanted a coffee break but no permit (must stay open)");
-                    }
+                if (takeBreak) {
+                    office.closeCounter(this);               // its customers move to other queues
+                    Thread.sleep(500);
+                    office.reopenCounter(this);
                 }
             }
         } catch (InterruptedException e) {
