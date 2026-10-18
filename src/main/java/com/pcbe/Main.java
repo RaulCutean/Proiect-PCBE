@@ -23,7 +23,7 @@ public class Main {
             String value = config.getProperty(key).trim();
             String name = key.substring(key.indexOf('.') + 1);
             if (key.startsWith("office.")) {
-                offices.put(name, new Office(name, Integer.parseInt(value)));
+                offices.put(name, new Office(name, Integer.parseInt(value), offices, documents));
             } else if (key.startsWith("document.")) {
                 String[] parts = value.split("\\|", -1); // "Office|Doc1,Doc2"
                 documents.put(name, new Document(name, parts[0].trim(), split(parts[1])));

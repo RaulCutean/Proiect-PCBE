@@ -2,6 +2,7 @@ package com.pcbe;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -18,9 +19,13 @@ public class Office {
     private final Condition queuesChanged = lock.newCondition();     // waiting customers re-check their position
     final Semaphore breakPermits;                                    // how many counters may be on break at once
     private final List<Counter> counters = new ArrayList<>();
+    private final Map<String, Office> offices;     // all offices, used to verify presented documents
+    private final Map<String, Document> documents; // all documents
 
-    public Office(String name, int counterCount) {
+    public Office(String name, int counterCount, Map<String, Office> offices, Map<String, Document> documents) {
         this.name = name;
+        this.offices = offices;
+        this.documents = documents;
         for (int i = 1; i <= counterCount; i++) {
             counters.add(new Counter(this, name + "-counter" + i, lock.newCondition()));
         }
@@ -114,13 +119,32 @@ public class Office {
     }
 
     // Called by a counter thread: the document is issued, wake the customer.
-    void finish(Counter counter, Request request) {
+    void finish(Counter counter, Request request) throws InterruptedException {
         lock.lock();
         try {
+            // DEADLOCK: we still hold THIS office's lock while verify() takes ANOTHER office's lock.
+            // Police (issuing IdCard) holds the Police lock and waits for the CivilRegistry lock to verify
+            // the BirthCertificate, while CivilRegistry (issuing MarriageCertificate) holds the CivilRegistry
+            // lock and waits for the Police lock to verify the IdCard. Each waits for the other forever.
+            for (String required : request.document.requires()) {
+                offices.get(documents.get(required).office()).verify(request.customer, required);
+            }
             System.out.println(counter.getName() + " issued " + request.document.name() + " to " + request.customer);
             request.done = true;
             counter.serving = null;
             queuesChanged.signalAll();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // Another office asks: "did you really issue this document to this customer?"
+    // Checking the archive takes a while (50 ms) and needs this office's lock.
+    void verify(String customer, String document) throws InterruptedException {
+        lock.lock();
+        try {
+            System.out.println(name + " verifies " + document + " of " + customer);
+            Thread.sleep(50);
         } finally {
             lock.unlock();
         }
